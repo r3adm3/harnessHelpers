@@ -9,13 +9,16 @@ Requirements:
 - requests library: pip install requests
 - Valid Harness API token with appropriate permissions
 - Account ID from your Harness instance
+- HARNESS_API_TOKEN environment variable set
 
 Usage:
+    export HARNESS_API_TOKEN="your_token_here"
     python harness_pipeline_counter.py
 """
 
 import requests
 import json
+import os
 from typing import Dict, List, Optional
 from collections import defaultdict
 import sys
@@ -56,7 +59,11 @@ class HarnessAPIClient:
         Returns:
             JSON response data or None if error
         """
-        url = f"{self.base_url}/ng/api{endpoint}"
+        # Handle different API path prefixes
+        if endpoint.startswith('/pipeline/api/'):
+            url = f"{self.base_url}{endpoint}"  # pipeline APIs don't use /ng prefix
+        else:
+            url = f"{self.base_url}/ng/api{endpoint}"  # NextGen APIs use /ng/api prefix
         
         try:
             response = self.session.request(
@@ -70,10 +77,11 @@ class HarnessAPIClient:
             return response.json()
         
         except requests.exceptions.RequestException as e:
-            print(f"API request failed: {e}")
+            print(f"      ⚠️  API request failed: {e}")
             if hasattr(e, 'response') and e.response is not None:
-                print(f"Response status: {e.response.status_code}")
-                print(f"Response text: {e.response.text}")
+                print(f"      Response status: {e.response.status_code}")
+                if e.response.status_code != 404:  # Don't show response text for 404s to reduce noise
+                    print(f"      Response text: {e.response.text}")
             return None
     
     def get_organizations(self) -> List[Dict]:
@@ -167,54 +175,109 @@ class HarnessAPIClient:
         Returns:
             List of pipeline dictionaries
         """
-        endpoint = f"/pipelines/list"
-        params = {
-            'accountIdentifier': self.account_id,
-            'orgIdentifier': org_identifier,
-            'projectIdentifier': project_identifier,
-            'page': 0,
-            'size': 100
-        }
+        # Try different API approaches for getting pipelines
+        approaches = [
+            {
+                "name": "POST /pipeline/api/pipelines/list",
+                "method": "POST",
+                "endpoint": "/pipeline/api/pipelines/list",
+                "data": {
+                    "filterType": "PipelineSetup"
+                },
+                "params": {
+                    'accountIdentifier': self.account_id,
+                    'orgIdentifier': org_identifier,
+                    'projectIdentifier': project_identifier,
+                    'page': 0,
+                    'size': 100
+                }
+            },
+            {
+                "name": "GET /pipelines with query params",
+                "method": "GET", 
+                "endpoint": "/pipelines",
+                "params": {
+                    'accountIdentifier': self.account_id,
+                    'orgIdentifier': org_identifier,
+                    'projectIdentifier': project_identifier,
+                    'page': 0,
+                    'limit': 100
+                }
+            },
+            {
+                "name": "POST /ng/api/pipelines/list",
+                "method": "POST",
+                "endpoint": "/pipelines/list",
+                "data": {
+                    "filterType": "PipelineSetup"
+                },
+                "params": {
+                    'accountIdentifier': self.account_id,
+                    'orgIdentifier': org_identifier,
+                    'projectIdentifier': project_identifier
+                }
+            }
+        ]
         
-        pipelines = []
-        page = 0
-        
-        while True:
-            params['page'] = page
-            response = self._make_request('GET', endpoint, params=params)
+        for approach in approaches:
+            #print(f"      🔍 Trying: {approach['name']}")
             
-            if not response or not response.get('data'):
-                break
-            
-            page_data = response['data']
-            if not page_data.get('content'):
-                break
+            try:
+                response = self._make_request(
+                    method=approach['method'],
+                    endpoint=approach['endpoint'],
+                    params=approach['params'],
+                    data=approach.get('data')
+                )
                 
-            pipelines.extend(page_data['content'])
-            
-            # Check if there are more pages
-            total_pages = page_data.get('totalPages', 1)
-            if page + 1 >= total_pages:
-                break
-            
-            page += 1
+                if response:
+                    # Check different response structures
+                    data = response.get('data', response)
+                    
+                    if isinstance(data, list):
+                        print(f"      ✅ Success! Found {len(data)} pipelines")
+                        return data
+                    elif data.get('content'):
+                        pipelines = data['content']
+                        print(f"      ✅ Success! Found {len(pipelines)} pipelines")
+                        return pipelines
+                    elif data.get('pipelines'):
+                        pipelines = data['pipelines']
+                        print(f"      ✅ Success! Found {len(pipelines)} pipelines")
+                        return pipelines
+                    elif 'totalElements' in data:
+                        print(f"      ✅ Success! Found {data.get('totalElements', 0)} total pipelines")
+                        return data.get('content', [])
+                    else:
+                        print(f"      ❓ Unexpected response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                        
+            except Exception as e:
+                print(f"      ❌ Failed: {str(e)}")
+                continue
         
-        return pipelines
+        print(f"      ❌ All approaches failed for project {project_identifier}")
+        return []
 
 def main():
     """Main function to count pipelines per organization"""
     
     # Configuration - UPDATE THESE VALUES
-    API_TOKEN = "your_harness_api_token_here"
-    ACCOUNT_ID = "your_account_id_here"
+    API_TOKEN = os.getenv('HARNESS_API_TOKEN')
+    ACCOUNT_ID = os.getenv('HARNESS_ACCT_ID')
     BASE_URL = "https://app.harness.io"  # Change if using different Harness instance
     
     # Validate configuration
-    if API_TOKEN == "your_harness_api_token_here" or ACCOUNT_ID == "your_account_id_here":
-        print("❌ Please update the API_TOKEN and ACCOUNT_ID in the script before running.")
+    if not API_TOKEN:
+        print("❌ HARNESS_API_TOKEN environment variable is not set.")
+        print("\nTo set your API token:")
+        print("  export HARNESS_API_TOKEN='your_harness_api_token_here'")
         print("\nTo get your API token:")
         print("1. Go to Harness UI > Account Settings > Access Control > API Keys")
         print("2. Create a new Personal Access Token or Service Account token")
+        sys.exit(1)
+    
+    if ACCOUNT_ID == "your_account_id_here":
+        print("❌ Please update the ACCOUNT_ID in the script before running.")
         print("\nTo get your Account ID:")
         print("1. Look in the URL when logged into Harness")
         print("2. Or check Account Settings in the Harness UI")
@@ -243,8 +306,10 @@ def main():
     total_pipelines = 0
     
     for org in organizations:
-        org_id = org.get('identifier', 'unknown')
-        org_name = org.get('name', org_id)
+        # Handle nested organization structure
+        org_data = org.get('organization', org)  # Use 'organization' key if it exists, otherwise use org directly
+        org_id = org_data.get('identifier', 'unknown')
+        org_name = org_data.get('name', org_id)
         org_details[org_id] = org_name
         
         print(f"\n📁 Processing organization: {org_name} ({org_id})")
@@ -256,8 +321,15 @@ def main():
         org_pipeline_count = 0
         
         for project in projects:
-            project_id = project.get('identifier', 'unknown')
-            project_name = project.get('name', project_id)
+            # Handle nested project structure
+            project_data = project.get('project', project)  # Use 'project' key if it exists, otherwise use project directly
+            project_id = project_data.get('identifier', 'unknown')
+            project_name = project_data.get('name', project_id)
+            
+            # Skip if we still don't have a valid project_id
+            if project_id == 'unknown':
+                print(f"      ⚠️  Skipping project with unknown identifier: {project}")
+                continue
             
             # Get pipelines in this project
             pipelines = client.get_pipelines_in_project(org_id, project_id)
